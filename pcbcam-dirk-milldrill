@@ -1,0 +1,77 @@
+#!/bin/sh
+
+# Für dieses Script benötigst Du Eagle und pcb2gcode. Du findest diese 
+# Programme hier:
+#
+#   Eagle:       http://www.cadsoft.de/
+#   pcb2gcode:   http://sourceforge.net/apps/mediawiki/pcb2gcode
+#
+# Stefan May <smay@4finger.net>  
+# Lizenz: CC-BY-SA http://creativecommons.org/licenses/by-sa/2.0/
+
+cat >millproject <<EOF
+# everything in here is in millimeter
+metric=1
+milldrill=1
+# high offset means voronoi regions will be calculated
+offset=0.5
+dpi=1000
+
+# parameters for isolation routing / engraving / etching
+zwork=-2.9
+zsafe=5
+zchange=30
+mill-feed=1100
+mill-speed=20000
+
+# parameters for cutting out boards
+cutter-diameter=0.8
+zcut=-3
+cut-feed=200
+cut-speed=20000
+cut-infeed=0.1
+outline-width=0.3
+fill-outline=1
+
+# drilling parameters
+zdrill=1
+drill-feed=600
+drill-speed=20000
+
+
+
+EOF
+
+if [ "$1" = "--clean" ] ; then
+    rm -f pcb.brd
+    rm -f back.cnc back.gpi back.ngc back_stop.ps
+    rm -f front.cnc front.gpi front.ngc front_stop.ps
+    rm -f outline.cnc outline.gpi outline.ngc
+    rm -f drill.cnc drill.dri drill.ngc
+    rm -f *.png millproject
+elif [ -f "$1" ] ; then
+    mkdir $1-files
+    mv millproject $1-files/
+
+    cp $1 $1-files/pcb.brd 
+    cd $1-files/
+    
+    eagle -X -O+ -dGERBER_RS274X -oback.cnc      pcb.brd Bot Pads Vias
+    eagle -X -O+ -dGERBER_RS274X -ofront.cnc     pcb.brd Top Pads Vias
+    eagle -X -O+ -dEXCELLON      -odrill.cnc     pcb.brd Drills Holes
+    eagle -X -O+ -dGERBER_RS274X -ooutline.cnc   pcb.brd Dimension
+    eagle -X -O+ -dPS            -oback_stop.ps  pcb.brd bStop Dimension
+    eagle -X -O+ -dPS            -ofront_stop.ps pcb.brd tStop Dimension
+    pcb2gcode --outline outline.cnc --back back.cnc --front front.cnc --drill drill.cnc 
+  # pcb2gcode  --drill drill.cnc
+    # remove temporary files
+    rm -f pcb.brd
+    rm -f back.cnc back.gpi
+    rm -f front.cnc front.gpi
+    rm -f outline.cnc outline.gpi
+    rm -f drill.cnc drill.dri
+    #rm -f *.png
+    rm -f  millproject
+else
+    echo "$0 [--clean | filename]"
+fi
