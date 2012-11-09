@@ -9,105 +9,137 @@
 #include <avr/eeprom.h>
 #include <avr/interrupt.h>   
 #include <avr/pgmspace.h>
-#include <util/delay.h>
+#include <avr/wdt.h>
 #include <WProgram.h>
 
 #define NODE_ID 1
 #define NETGROUP 42
 
-#define SOCKET_GROUPS 1
-#define SOCKET_IDS 4
+#define SOCKET_GROUPS 2
+#define SOCKET_IDS 8
 
 #define TRANSMITTER_PIN 9
 
-#define PULSE_LENGTH_0 521
-#define PULSE_LENGTH_1 1224
-#define PULSE_PAUSE_LENGTH 3265
+#define NUM_COUNTERS 3
 
-#define NUM_REPEATS 25
-#define REPEAT_PAUSE_MS 22
+IRsend irsend;
 
-#define NUM_COUNTERS 5
+MilliTimer sendTimer;
+MilliTimer powerTimer;
+
+bool pending;
+uint32_t doorbell_seqnum;
+uint32_t last_smartmeter_seq;
 
 typedef struct {
-	char counter[NUM_COUNTERS];
-	uint32_t duration[NUM_COUNTERS];
-} Powermeter;
-Powermeter powermeter;
+	uint32_t counter_millis;
+	uint32_t active_counter;
+} smartmeter_pulse_t;
+smartmeter_pulse_t smartmeter_pulse;
+
+uint32_t smartmeter_counter[NUM_COUNTERS + 2];
 
 typedef struct {
 	int pir;
 	int tC;
 	int t_awake;
-} Thermometer;
-Thermometer thermometer;
+} thermometer_t;
+thermometer_t thermometer;
+
+typedef struct {
+	byte start;
+	byte later;
+	byte buzzer;
+	byte ringer;
+	int voltage;
+} doorbell_t;
+doorbell_t doorbell;
+
+typedef struct {
+ int dummy;
+ int group;
+ int id;
+ int state;
+} rf12socket_t;
+rf12socket_t rf12socket;
+rf12socket_t rf12socket_answer;
+
+typedef struct {
+	int switch_id;
+	int key_id;
+} rf12switch_t;
+rf12switch_t rf12switch;
+
+
+byte buzzer;
 
 char serialString[256];
 char inChar = -1;
 int strIdx = 0;
 uint32_t msg_id;
 
-bool socketState[SOCKET_IDS][SOCKET_GROUPS];
-bool sequences[8][26] = {
-
-	{1,0,0,1,1,0,0,0,0,0,0,0,1,1,1,1,1,1,1,0,1,1,0,1,1,1},
-	{1,0,0,1,1,0,0,0,0,0,0,0,1,1,0,1,1,1,1,1,1,1,0,0,1,1},
-
-	{1,0,0,1,1,0,0,0,0,0,0,0,1,1,0,1,1,0,1,0,1,1,1,1,1,0},
-	{1,0,0,1,1,0,0,0,0,0,0,0,1,1,1,1,1,0,1,1,1,1,1,0,1,0},
-
-	{1,0,0,1,1,0,0,0,0,0,0,0,1,1,0,1,0,1,1,0,1,1,1,1,0,1},
-	{1,0,0,1,1,0,0,0,0,0,0,0,1,1,1,1,0,1,1,1,1,1,1,0,0,1},
-
-	{1,0,0,1,1,0,0,0,0,0,0,0,1,1,1,1,0,0,1,0,1,1,0,1,0,0},
-	{1,0,0,1,1,0,0,0,0,0,0,0,1,1,0,1,0,0,1,1,1,1,0,0,0,0}
-};
-
-IRsend irsend;
-
-
-void pulseOut(int pin, int us) {
-	digitalWrite(pin, HIGH);
-	us = max(us - 20, 1);
-	delayMicroseconds(us);
-	digitalWrite(pin, LOW);
-} 
-
-void transmitBit(bool value) {
-	if(value) {
-		pulseOut(TRANSMITTER_PIN, PULSE_LENGTH_1);
-	} else {
-		pulseOut(TRANSMITTER_PIN, PULSE_LENGTH_0);
-	}
-
-	delayMicroseconds(PULSE_PAUSE_LENGTH);
-}
 
 
 void printHeader() {
-	Serial.print("hdr: 0x");
-	Serial.print(rf12_hdr, HEX);
+	int rf12_node_id;
+	rf12_node_id = 0x1F & rf12_hdr;
+	Serial.print("Node ID: ");
+	Serial.print(rf12_node_id, DEC);
 	Serial.print(", seq: ");
 	Serial.print(rf12_seq, DEC);
 	Serial.print(", data =");
 }
 
-void printPower() {
-	powermeter = *(Powermeter*) rf12_data;
-	printHeader();
-	for (int i = 0; i < NUM_COUNTERS; i++) {
+uint32_t last_smartmeter_millis = 0;
+void printSmartmeterPulse() {
+	smartmeter_pulse = *(smartmeter_pulse_t*) rf12_data;
+	int seq_diff;
+    int milli_diff;
+
+	if (last_smartmeter_seq) {
+		seq_diff = rf12_seq - last_smartmeter_seq;
+		if (seq_diff > 1) {
+			Serial.print("ALARM: Smartmeter LOST ");
+			Serial.print(seq_diff - 1, DEC);
+			Serial.print(" PULSE(S)!");
+			Serial.println();
+			smartmeter_counter[NUM_COUNTERS] += seq_diff - 1;
+		} else if (seq_diff < 0) {
+			Serial.print("ALARM: Counter overflow or controller reset - seq_diff = ");
+            Serial.println(seq_diff);
+		}
+	}
+	last_smartmeter_seq = rf12_seq;
+    milli_diff = smartmeter_pulse.counter_millis - last_smartmeter_millis;
+    last_smartmeter_millis = smartmeter_pulse.counter_millis;
+
+    printHeader();
+	Serial.print(" Smartmeter counted pulse on meter: ");
+	Serial.print(smartmeter_pulse.active_counter + 1, DEC);
+    Serial.print(", millis: ");
+	Serial.print(smartmeter_pulse.counter_millis);
+    Serial.print(", diff: ");
+    Serial.println(milli_diff);
+
+	smartmeter_counter[smartmeter_pulse.active_counter]++;
+	smartmeter_counter[NUM_COUNTERS + 1]++;
+}
+
+
+void printSmartmeterAggregated() {
+	Serial.print("Smartmeter aggregated:");
+	for (int i = 0; i < NUM_COUNTERS + 2; i++) {
 		Serial.print(' ');
-		Serial.print(powermeter.counter[i], DEC);
-		Serial.print(' ');
-		Serial.print(powermeter.duration[i], DEC);
+		Serial.print(smartmeter_counter[i], DEC);
+		smartmeter_counter[i] = 0;
 	}
 	Serial.println();
 }
 
 void printTemp() {
- int tC, tFrac;
-	thermometer = *(Thermometer*) rf12_data;
- tC = thermometer.tC;                             // read high-resolution temperature
+ int tC, tFrac, tCR, tFracR;
+	thermometer = *(thermometer_t*) rf12_data;
+ tC = tCR = thermometer.tC;                             // read high-resolution temperature
 
 	printHeader();
 	Serial.print(' ');
@@ -117,7 +149,7 @@ void printTemp() {
 		Serial.print("-");                          // indicate negative
  }
 
- tFrac = tC % 100;                             // extract fractional part
+ tFrac = tFracR = tC % 100;                             // extract fractional part
  tC /= 100;                                    // extract whole part
 
  Serial.print(tC);
@@ -130,6 +162,114 @@ void printTemp() {
 	Serial.print("ms, PIR: ");
 	Serial.print(thermometer.pir);
 	Serial.println();
+
+	Serial.print("REST PUT: URL{http://yavdr:8081/rest/items/Temperature_FF_Office/state}, DATA{");
+ if (tCR < 0) {
+		tCR = -tCR;                                   // fix for integer division
+		Serial.print("-");                          // indicate negative
+ }
+
+ tFracR = tCR % 100;                             // extract fractional part
+ tCR /= 100;                                    // extract whole part
+
+ Serial.print(tCR);
+ Serial.print(".");
+ if (tFracR < 10)
+		Serial.print("0");
+ Serial.print(tFracR);
+	Serial.println("}");
+}
+
+void printDoorbell() {
+	doorbell = *(doorbell_t*) rf12_data;
+
+	int milliVolts;
+	milliVolts = (doorbell.voltage * (330000/511)) / 100;
+
+/*
+	printHeader();
+	Serial.print(" #");
+	Serial.print(doorbell_seqnum);
+	Serial.print(" start: ");
+	Serial.print(doorbell.start, DEC);
+	Serial.print(" recvd: ");
+	Serial.print(doorbell.later, DEC);
+*/
+	Serial.print("Doorbell battery voltage: ");
+	Serial.print(doorbell.voltage / (5120/33), DEC);
+	Serial.print(".");
+	Serial.print(doorbell.voltage % (5120/33), DEC);
+	Serial.println("V");
+
+	if (milliVolts < 4000) {
+		Serial.print("WARNING: DOORBELL BATTERY LOW: ");
+		Serial.print(doorbell.voltage / (5120/33), DEC);
+		Serial.print(".");
+		Serial.print(doorbell.voltage % (5120/33), DEC);
+		Serial.println("V");
+	}
+
+	if (doorbell.ringer == 1) {
+		printHeader();
+		Serial.println(" DOORBELL!");
+		Serial.println("REST PUT: URL{http://yavdr:8081/rest/items/doorbell/state}, DATA{ON}");
+		doorbell.ringer == 0;
+	}
+}
+
+void printSocket() {
+	rf12socket_answer = *(rf12socket_t*) rf12_data;
+	Serial.print("MSG ID: 0x");
+	Serial.print(msg_id, HEX);
+	Serial.print(": ");
+	printHeader();
+	Serial.print(" Socket State: Group: ");
+	Serial.print(rf12socket_answer.group);
+	Serial.print(", ID: ");
+	Serial.print(rf12socket_answer.id);
+	Serial.print(", State: ");
+	Serial.println(rf12socket_answer.state);
+
+	Serial.print("REST PUT: URL{http://yavdr:8081/rest/items/socket_");
+	Serial.print(rf12socket_answer.group);
+	Serial.print("_");
+	Serial.print(rf12socket_answer.id);
+	Serial.print("/state}, DATA{");
+	if (rf12socket_answer.state) {
+		Serial.println("ON}");
+	} else {
+		Serial.println("OFF}");
+	}
+}
+
+void printSocketAck() {
+	rf12socket_answer = *(rf12socket_t*) rf12_data;
+	Serial.print("MSG ID: 0x");
+	Serial.print(msg_id, HEX);
+	Serial.print(": {\"socket_state\": [ ");
+	Serial.print("\"group\": \"");
+	Serial.print(rf12socket_answer.group);
+	Serial.print("\", \"id\": \"");
+Serial.print(rf12socket_answer.id);
+	Serial.print("\", \"state\": \"");
+	Serial.print(rf12socket_answer.state);
+	Serial.print("\"");
+	Serial.println(" ] };");
+}
+
+void printSwitch() {
+	rf12switch = *(rf12switch_t*) rf12_data;
+	printHeader();
+	Serial.print("Switch ID: ");
+	Serial.print(rf12switch.switch_id);
+	Serial.print(", Key ID: ");
+	Serial.println(rf12switch.key_id);
+
+	Serial.print("REST PUT: URL{http://yavdr:8081/rest/items/switch_");
+	Serial.print(rf12switch.switch_id);
+	Serial.print("/state}, DATA{");
+	Serial.print(rf12switch.key_id);
+	Serial.println("}");
 }
 
 void printUnknown() {
@@ -143,17 +283,28 @@ void printUnknown() {
 	Serial.print(rf12_hdr, HEX);
 	Serial.print(")");
 	Serial.print(", seq: ");
-	Serial.println(rf12_seq, DEC);
+	Serial.print(rf12_seq, DEC);
+	Serial.print(", length: ");
+	Serial.println(rf12_len, DEC);
 }
 
 void receiveRF12() {
 	int rf12_node_id;
 	if (rf12_recvDone() && (rf12_crc == 0)) {
 		rf12_node_id = 0x1F & rf12_hdr;
-		if ((rf12_node_id == 5) && (rf12_len == sizeof(Powermeter))) {
-			printPower();
-		} else if ((rf12_node_id == 6)  && (rf12_len == sizeof(Thermometer))) {
+		if ((rf12_node_id == 5) && (rf12_len == sizeof(smartmeter_pulse_t))) {
+			printSmartmeterPulse();
+		} else if ((rf12_node_id == 6)  && (rf12_len == sizeof(thermometer_t))) {
 			printTemp();
+		} else if ((rf12_node_id == 7) && (rf12_len == sizeof(doorbell_t))) {
+			sendTimer.set(0);
+			printDoorbell();
+		} else if ((rf12_node_id == 8) && (rf12_len == sizeof(rf12socket_t))) {
+			printSocket();
+		} else if ((rf12_node_id == 1) && (rf12_len == sizeof(rf12socket_t))) {
+			printSocket();
+		} else if ((rf12_node_id == 3) && (rf12_len == sizeof(rf12switch_t))) {
+			printSwitch();
 		} else { // unknown node ID
 			printUnknown();
 		}
@@ -163,71 +314,22 @@ void receiveRF12() {
 			rf12_sendStart(RF12_ACK_REPLY, 0, 0);
 		}
 	}
-}
 
+ // timedSend: 
+	if (sendTimer.poll(2096))
+		pending = 1;
 
-void transmitSequence(bool* sequence, byte seqLen, byte numRepeat) {
-	for(byte n=0; n<numRepeat; n++) {
-		for(byte i=0; i<seqLen; i++) {
-			transmitBit(sequence[i]);
-		}
-		int start = millis();
-		receiveRF12();
-		int end = millis();
-		if ((end - start) > 0) {
-			Serial.print("spent ");
-			Serial.print(end - start);
-			Serial.println("ms processing RF12 Packets");
-		}
-		delay(REPEAT_PAUSE_MS - (end - start));
+	if (pending && rf12_canSend()) {
+		pending = 0;
+		//Serial.println("Polling Doorbell");
+		doorbell.buzzer = buzzer;
+		rf12_sendStart(7, &doorbell, sizeof(doorbell_t));
+		buzzer = 0;
+		++doorbell_seqnum;
 	}
 }
 
-void printSocketState() {
-	int group, id;
-	Serial.print("MSG ID: 0x");
-	Serial.print(msg_id, HEX);
-	Serial.print(": {\"socket_state\": [ ");
-	for (id = 0 ; id < SOCKET_IDS ; id++) {
-		Serial.print("{");
-		for (group = 0 ; group < SOCKET_GROUPS ; group++) {
-			bool onoff = socketState[id][group];
-			Serial.print("\"group\": \"");
-			Serial.print(group +1);
-			Serial.print("\", \"id\": \"");
-			Serial.print(id +1);
-			Serial.print("\", \"state\": \"");
-			Serial.print(onoff);
-			Serial.print("\"");
-		}
-		Serial.print("}");
-		if (id < SOCKET_IDS - 1){
-			Serial.print(", ");
-		}
-	}
-	Serial.println(" ] };");
-}
 
-//void transmitOOK() {
-void transmitOOK(int group, int id, int onoff) {
-
-	//int group, id;
-	//for (id = 0 ; id < SOCKET_IDS ; id++) {
-		//for (group = 0 ; group < SOCKET_GROUPS ; group++) {
-			//bool onoff = socketState[id][group];
-			Serial.print("switching socket: ");
-			Serial.print("Group: ");
-			Serial.print(group +1);
-			Serial.print(", id: ");
-			Serial.print(id +1);
-			Serial.print(", onoff: ");
-			Serial.print(onoff);
-			Serial.println();
-
-			transmitSequence(sequences[id * 2 + onoff], 26, NUM_REPEATS);
-		//}
-	//}
-}
 
 void transmitIR(int proto, int length, uint32_t code1, uint32_t code2) {
 					//unsigned long long code =  ((unsigned long long)code1 << 32) | (unsigned long long)code2;
@@ -269,12 +371,77 @@ void transmitIR(int proto, int length, uint32_t code1, uint32_t code2) {
 */
 }
 
+static void invalidCommand (char *buf) {
+	Serial.print("MSG ID: 0x");
+	Serial.print(msg_id, HEX);
+	Serial.print(": ");
+	printHeader();
+	Serial.println("INVALID COMMAND");
+}
+
+
+static void pollRF12socket (int group, int id) {
+	memset(&rf12socket_answer, 0, sizeof rf12socket_answer);
+	Serial.print("Polling RF12 Socket: Group: ");
+	Serial.print(group);
+	Serial.print(", ID: ");
+	Serial.println(id);
+
+	rf12socket.dummy = 'S';
+	rf12socket.group = group;
+	rf12socket.id = id;
+	rf12socket.state = '?';
+	receiveRF12();
+	rf12_sendStart(RF12_HDR_ACK, &rf12socket, sizeof(rf12socket));
+}
+
+static void switchRF12socket (int group, int id, int state) {
+	memset(&rf12socket_answer, 0, sizeof rf12socket_answer);
+	Serial.print("Switching RF12 Socket: Group: ");
+	Serial.print(group);
+	Serial.print(", ID: ");
+	Serial.print(id);
+	Serial.print(", State: ");
+	Serial.println(state);
+
+	rf12socket.dummy = 'S';
+	rf12socket.group = group;
+	rf12socket.id = id;
+	rf12socket.state = state;
+	int max_retries = 10;
+	bool rf12socket_ack_pending = 1;
+	while (rf12socket_ack_pending == 1) {
+		Serial.println(max_retries);
+		if (max_retries-- > 0) {
+			while (!rf12_canSend()) {
+				receiveRF12();
+			}
+			rf12_sendStart(RF12_HDR_ACK, &rf12socket, sizeof(rf12socket));
+			rf12_sendWait(1);
+			Serial.println("!");
+			for (int i=0; i <= 5000; i++) {
+				receiveRF12();
+			}
+			if ((rf12socket_answer.group == group) && (rf12socket_answer.id == id) && (rf12socket_answer.state == state)) {
+				Serial.println("SUCCESS!");
+				rf12socket_ack_pending = 0;
+			}
+			Serial.println(".");
+		} else {
+			Serial.println("FAILED!");
+			rf12socket_ack_pending = 0;
+		}
+	}
+/*
+*/
+}
 
 void readSerialString () {
 
+	int dummy;
 	int socketGroup;
 	int socketId;
-	int socketOnOff;
+	char socketCmd[32];
 
 	int irProtocol;
 	int irLength;
@@ -286,15 +453,21 @@ void readSerialString () {
 			if ((inChar == '\n') || (inChar == '\r')) {
 
 				// Parse input
-				if (sscanf_P(serialString, PSTR("MSG ID: 0x%04x: command=socket.%d.%d.%d"), &msg_id, &socketGroup, &socketId, &socketOnOff) == 4) {
-					socketState[socketId - 1][socketGroup - 1] = socketOnOff;
-					printSocketState();
-					transmitOOK(socketGroup - 1, socketId - 1, socketOnOff);
-					//transmitOOK();
-				} else if (sscanf_P(serialString, PSTR("MSG ID: 0x%04x: command=socketstate"), &msg_id) == 1) {
-					printSocketState();
+				if (sscanf_P(serialString, PSTR("MSG ID: 0x%04x: /socket/%d/%d/%s"), &msg_id, &socketGroup, &socketId, &socketCmd) == 4) {
+					if (0 == strncmp(socketCmd, "state", 6)) {
+						pollRF12socket(socketGroup, socketId);
+					} else if (0 == strncmp(socketCmd, "OFF", 3)) {
+						switchRF12socket(socketGroup, socketId, 0);
+					} else if (0 == strncmp(socketCmd, "ON", 2)) {
+						switchRF12socket(socketGroup, socketId, 1);
+					} else {
+						invalidCommand(serialString);
+					}
 				} else if (sscanf_P(serialString, PSTR("MSG ID: 0x%04x: command=ir.%d.%d.%lx.%lx"), &msg_id, &irProtocol, &irLength, &irCode[0], &irCode[1]) == 5) {
 					transmitIR(irProtocol, irLength, irCode[0], irCode[1]);
+				} else if (sscanf_P(serialString, PSTR("MSG ID: 0x%04x: command=buzzer.%d"), &msg_id, dummy) == 2) {
+					Serial.println("Setting buzzer to 1");
+					buzzer = 1;
 				} else {
 					Serial.print("Unrecognized String (length: ");
 					Serial.print(strIdx);
@@ -313,7 +486,13 @@ void readSerialString () {
 		}
 	}
 }
+
+
 void setup() {                
+	//init_ook_values();
+	wdt_reset();
+	wdt_enable(WDTO_2S);
+
 	Serial.begin(57600);
 	Serial.println("[Alis Home Automation Network - Master Node]");
 	byte cryptArray[16];
@@ -328,9 +507,18 @@ void setup() {
 	pinMode(TRANSMITTER_PIN, OUTPUT);
 	rf12_initialize(NODE_ID, RF12_868MHZ, NETGROUP);
 	rf12_encrypt(RF12_EEPROM_EKEY);
+	rf12_easyInit(0);
 }
 
 void loop() {
+	if(powerTimer.poll(60000))
+    printSmartmeterAggregated();
 	readSerialString();
 	receiveRF12();
+	wdt_reset();
 }
+
+
+
+
+// vim: expandtab sw=4 ts=4

@@ -120,6 +120,9 @@ $(OUTPUT).hex: $(OUTPUT).elf
 upload: all
 \tscp $(OUTPUT).hex wrt:/tmp/ ; ssh wrt "$(AVRDUDE) -Uflash:w:/tmp/$(OUTPUT).hex:i"
 
+upload_local: all
+\tavrdude -p $(MCU) -c arduino -P $(PORT) -v -Uflash:w:$(OUTPUT).hex:i
+
 clean:
 \t@rm -f $(LIBRARIES) $(OUTPUT).elf $(OUTPUT).hex $(shell find . -follow -name "*.o")
   
